@@ -1,0 +1,7 @@
+playwright
+requests
+python-dotenv
+google-genai
+Pillow
+torch
+transformers
