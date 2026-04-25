@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,49 @@ from transformers import CLIPModel, CLIPProcessor
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+DEFAULT_TITLE_BLACKLIST = [
+    "video",
+    "videocassette",
+    "movie",
+    "pelicula",
+    "película",
+    "film",
+    "organizer",
+    "sacchi",
+    "cassettiera",
+    "porta",
+    "telecamera",
+    "recorder",
+    "scarpiera",
+    "runner",
+    "tovagliette",
+    "pochette",
+    "pantalone",
+    "smalti",
+    "chiusura",
+    "canotta",
+    "bush",
+    "chicco",
+    "marella",
+    "vera pelle",
+    "brocante",
+    "jvs",
+    "digital",
+    "camera",
+    "overdrive",
+    "classic",
+    "stereo",
+    "cassette recorder",
+    "cassette player",
+    "cassette deck",
+    "cassette box",
+    "cassette storage",
+    "cassette case",
+    "cassette organizer",
+    "wm",
+    "walkman",
+    "micro",
+]
 
 
 @dataclass
@@ -131,6 +175,42 @@ def load_reference_images(reference_dir: Path) -> list[Path]:
     if not refs:
         raise ValueError(f"No reference images found in {reference_dir}")
     return sorted(refs)
+
+
+def normalize_text_for_match(value: str) -> str:
+    lowered = value.lower().strip()
+    no_accents = "".join(
+        ch for ch in unicodedata.normalize("NFKD", lowered) if not unicodedata.combining(ch)
+    )
+    return no_accents
+
+
+def parse_blacklist_words(raw_words: str) -> list[str]:
+    if not raw_words.strip():
+        return []
+    words = []
+    for chunk in raw_words.split(","):
+        w = normalize_text_for_match(chunk)
+        if w:
+            words.append(w)
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(words))
+
+
+def filter_listings_by_title_blacklist(
+    listings: list[Listing], blacklist_words: list[str]
+) -> tuple[list[Listing], list[Listing]]:
+    if not blacklist_words:
+        return listings, []
+    kept: list[Listing] = []
+    removed: list[Listing] = []
+    for listing in listings:
+        title_norm = normalize_text_for_match(listing.title)
+        if any(word in title_norm for word in blacklist_words):
+            removed.append(listing)
+        else:
+            kept.append(listing)
+    return kept, removed
 
 
 def build_vinted_search_url(keyword: str) -> str:
@@ -852,6 +932,7 @@ def run_scan(
     max_reference_images: int,
     gemini_batch_size: int,
     clip_model_name: str,
+    title_blacklist_words: list[str],
     min_score: float,
     output_dir: str,
     seen_match_urls: set[str],
@@ -873,6 +954,12 @@ def run_scan(
         listings = scrape_first_page_listings(search_url, max_listings=max_listings, headed=headed)
 
     print(f"Collected {len(listings)} listing candidates.")
+    listings, removed = filter_listings_by_title_blacklist(listings, title_blacklist_words)
+    if title_blacklist_words:
+        print(
+            f"Title blacklist filtered {len(removed)} listing(s). "
+            f"{len(listings)} listing(s) remain for visual matching."
+        )
     if not listings:
         print("No listings found. Try another keyword or URL.")
         return
@@ -956,6 +1043,11 @@ def main() -> None:
         default="openai/clip-vit-base-patch32",
         help="Hugging Face CLIP model name for local matching.",
     )
+    parser.add_argument(
+        "--blacklist-words",
+        default=",".join(DEFAULT_TITLE_BLACKLIST),
+        help="Comma-separated words to exclude by listing title before image matching.",
+    )
     parser.add_argument("--min-score", type=float, default=0.70, help="Minimum Gemini score to count as match")
     parser.add_argument("--output-dir", default="output", help="JSON output folder")
     parser.add_argument(
@@ -970,6 +1062,7 @@ def main() -> None:
         help="Open Chromium in visible (headed) mode so you can watch actions live.",
     )
     args = parser.parse_args()
+    title_blacklist_words = parse_blacklist_words(args.blacklist_words)
 
     search_url = args.search_url or build_vinted_search_url(args.keyword)
     if args.search_mode == "keyword" and not args.keyword and not args.search_url:
@@ -987,6 +1080,7 @@ def main() -> None:
             max_reference_images=args.max_reference_images,
             gemini_batch_size=args.gemini_batch_size,
             clip_model_name=args.clip_model_name,
+            title_blacklist_words=title_blacklist_words,
             min_score=args.min_score,
             output_dir=args.output_dir,
             seen_match_urls=seen_match_urls,
@@ -1013,6 +1107,7 @@ def main() -> None:
                 max_reference_images=args.max_reference_images,
                 gemini_batch_size=args.gemini_batch_size,
                 clip_model_name=args.clip_model_name,
+                title_blacklist_words=title_blacklist_words,
                 min_score=args.min_score,
                 output_dir=args.output_dir,
                 seen_match_urls=seen_match_urls,

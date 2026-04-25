@@ -67,6 +67,12 @@ Use local CLIP matcher explicitly (no API):
 python main.py --search-mode image --matcher-mode clip --loop-minutes 0 --max-reference-images 5
 ```
 
+Title blacklist before visual matching (defaults include `video,videocassette,movie,pelicula,film`):
+
+```bash
+python main.py --search-mode image --matcher-mode clip --blacklist-words "video,videocassette,movie,pelicula,film"
+```
+
 Custom Vinted URL (if you want to control filters manually):
 
 ```bash
