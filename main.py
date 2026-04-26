@@ -898,6 +898,19 @@ def evaluate_listings_clip(
     return results
 
 
+def test_clip_match(reference_path: Path, candidate_path: Path, clip_model_name: str) -> None:
+    matcher = ClipMatcher(clip_model_name)
+    matcher.prepare_references([reference_path])
+    candidate_bytes = candidate_path.read_bytes()
+    score, best_ref = matcher.match(candidate_bytes)
+    print("\n=== CLIP comparison test ===")
+    print(f"reference: {reference_path}")
+    print(f"candidate: {candidate_path}")
+    print(f"best reference match: {best_ref}")
+    print(f"similarity score: {score:.6f}")
+    print("=== End of test ===\n")
+
+
 def persist_results(results: list[MatchResult], output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1051,6 +1064,21 @@ def main() -> None:
     parser.add_argument("--min-score", type=float, default=0.70, help="Minimum Gemini score to count as match")
     parser.add_argument("--output-dir", default="output", help="JSON output folder")
     parser.add_argument(
+        "--test-clip",
+        action="store_true",
+        help="Run a local CLIP comparison test between a reference image and a candidate image.",
+    )
+    parser.add_argument(
+        "--test-reference-path",
+        default="",
+        help="Path to the reference image for --test-clip.",
+    )
+    parser.add_argument(
+        "--test-candidate-path",
+        default="",
+        help="Path to the candidate image for --test-clip.",
+    )
+    parser.add_argument(
         "--loop-minutes",
         type=int,
         default=5,
@@ -1063,6 +1091,16 @@ def main() -> None:
     )
     args = parser.parse_args()
     title_blacklist_words = parse_blacklist_words(args.blacklist_words)
+
+    if args.test_clip:
+        if not args.test_reference_path or not args.test_candidate_path:
+            raise RuntimeError("--test-clip requires --test-reference-path and --test-candidate-path.")
+        test_clip_match(
+            Path(args.test_reference_path),
+            Path(args.test_candidate_path),
+            args.clip_model_name,
+        )
+        return
 
     search_url = args.search_url or build_vinted_search_url(args.keyword)
     if args.search_mode == "keyword" and not args.keyword and not args.search_url:
