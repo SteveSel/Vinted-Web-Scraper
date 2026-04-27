@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import cv2
+import numpy as np
 import requests
 from dotenv import load_dotenv
 from google import genai
@@ -102,6 +104,103 @@ def get_gemini_api_key() -> str:
     return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 
 
+class OrbMatcher:
+    def __init__(self) -> None:
+        self.orb = cv2.ORB_create(nfeatures=1000)
+        self.reference_features: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.flann = cv2.FlannBasedMatcher(
+            dict(algorithm=6, table_number=6, key_size=12, multi_probe_level=1),
+            dict(checks=50)
+        )
+
+    def _extract_features(self, image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+        """Extract ORB keypoints and descriptors from PIL image."""
+        # Convert PIL to OpenCV format
+        img_array = np.array(image.convert('RGB'))
+        img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+
+        # Detect and compute features
+        keypoints, descriptors = self.orb.detectAndCompute(img_cv, None)
+
+        if descriptors is None:
+            # Return empty arrays if no features found
+            return np.array([]), np.array([]).reshape(0, 32)
+
+        return keypoints, descriptors
+
+    def prepare_references(self, reference_paths: list[Path]) -> None:
+        """Prepare reference images by extracting their features."""
+        self.reference_features = {}
+        for ref_path in reference_paths:
+            try:
+                img = Image.open(ref_path).convert("RGB")
+                keypoints, descriptors = self._extract_features(img)
+                if len(descriptors) > 0:
+                    self.reference_features[ref_path.name] = (keypoints, descriptors)
+                    print(f"Extracted {len(descriptors)} features from {ref_path.name}")
+                else:
+                    print(f"Warning: No features found in {ref_path.name}")
+            except Exception as exc:
+                print(f"Failed to process {ref_path.name}: {exc}")
+
+    def match(self, image_bytes: bytes) -> tuple[float, str]:
+        """Match candidate image against all references using ORB features."""
+        if not self.reference_features:
+            raise RuntimeError("OrbMatcher references are not prepared.")
+
+        # Extract features from candidate image
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        cand_keypoints, cand_descriptors = self._extract_features(img)
+
+        if len(cand_descriptors) == 0:
+            return 0.0, ""
+
+        best_score = 0.0
+        best_ref = ""
+
+        # Compare against each reference
+        for ref_name, (ref_keypoints, ref_descriptors) in self.reference_features.items():
+            try:
+                # Find matches using FLANN
+                matches = self.flann.knnMatch(cand_descriptors, ref_descriptors, k=2)
+
+                # Apply Lowe's ratio test
+                good_matches = []
+                for match in matches:
+                    if len(match) == 2:
+                        m, n = match
+                        if m.distance < 0.75 * n.distance:
+                            good_matches.append(m)
+                    # If only 1 match, still consider it if distance is reasonable
+                    elif len(match) == 1:
+                        m = match[0]
+                        if m.distance < 50:  # Reasonable distance threshold
+                            good_matches.append(m)
+
+                if len(good_matches) < 4:
+                    continue
+
+                # Calculate score based on number of good matches and quality
+                match_ratio = len(good_matches) / min(len(cand_keypoints), len(ref_keypoints))
+                avg_distance = np.mean([m.distance for m in good_matches])
+
+                # Normalize distance (lower is better, so invert)
+                distance_score = max(0, 1.0 - avg_distance / 100.0)
+
+                # Combine ratio and distance scores
+                score = 0.7 * match_ratio + 0.3 * distance_score
+
+                if score > best_score:
+                    best_score = score
+                    best_ref = ref_name
+
+            except Exception as exc:
+                print(f"Matching failed for {ref_name}: {exc}")
+                continue
+
+        return best_score, best_ref
+
+
 class ClipMatcher:
     def __init__(self, model_name: str) -> None:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -110,6 +209,7 @@ class ClipMatcher:
         self.model.eval()
         self.reference_embeddings: torch.Tensor | None = None
         self.reference_names: list[str] = []
+        self.reference_hashes: dict[str, int] = {}
 
     @staticmethod
     def _make_variants(image: Image.Image) -> list[Image.Image]:
@@ -119,6 +219,24 @@ class ClipMatcher:
             base.rotate(-12, resample=Image.BICUBIC, expand=False),
             base.rotate(12, resample=Image.BICUBIC, expand=False),
         ]
+
+    @staticmethod
+    def _average_hash(image: Image.Image, hash_size: int = 8) -> int:
+        grayscale = image.convert("L").resize((hash_size, hash_size), Image.LANCZOS)
+        if hasattr(grayscale, "get_flattened_data"):
+            pixels = list(grayscale.get_flattened_data())
+        else:
+            pixels = list(grayscale.getdata())
+        avg = sum(pixels) / len(pixels)
+        result = 0
+        for idx, pixel in enumerate(pixels):
+            if pixel > avg:
+                result |= 1 << idx
+        return result
+
+    @staticmethod
+    def _hamming_distance(a: int, b: int) -> int:
+        return (a ^ b).bit_count()
 
     def _embed_images(self, images: list[Image.Image]) -> torch.Tensor:
         inputs = self.processor(images=images, return_tensors="pt")
@@ -143,11 +261,13 @@ class ClipMatcher:
     def prepare_references(self, reference_paths: list[Path]) -> None:
         ref_variants: list[Image.Image] = []
         ref_names: list[str] = []
+        self.reference_hashes = {}
         for ref_path in reference_paths:
             img = Image.open(ref_path).convert("RGB")
             variants = self._make_variants(img)
             ref_variants.extend(variants)
             ref_names.extend([ref_path.name] * len(variants))
+            self.reference_hashes[ref_path.name] = self._average_hash(img)
 
         embeddings = self._embed_images(ref_variants)
         self.reference_embeddings = embeddings
@@ -157,14 +277,43 @@ class ClipMatcher:
         if self.reference_embeddings is None or not self.reference_names:
             raise RuntimeError("ClipMatcher references are not prepared.")
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        cand_embeddings = self._embed_images(self._make_variants(img))
+        candidate_variants = self._make_variants(img)
+        cand_embeddings = self._embed_images(candidate_variants)
         sim = cand_embeddings @ self.reference_embeddings.T
-        best_flat_idx = int(torch.argmax(sim).item())
-        rows, cols = sim.shape
-        row = best_flat_idx // cols
-        col = best_flat_idx % cols
-        score = float(sim[row, col].item())
-        return score, self.reference_names[col]
+
+        unique_refs: list[str] = []
+        ref_to_cols: dict[str, list[int]] = {}
+        for idx, ref_name in enumerate(self.reference_names):
+            if ref_name not in ref_to_cols:
+                unique_refs.append(ref_name)
+                ref_to_cols[ref_name] = []
+            ref_to_cols[ref_name].append(idx)
+
+        best_ref = ""
+        best_score = -1.0
+        best_consistency = 0.0
+        for ref_name in unique_refs:
+            cols = ref_to_cols[ref_name]
+            ref_sim = sim[:, cols]
+            current_best = float(ref_sim.max().item())
+            if current_best <= best_score:
+                continue
+            best_ref = ref_name
+            best_score = current_best
+            best_consistency = float(ref_sim.max(dim=1).values.mean().item())
+
+        if best_ref:
+            hash_similarity = 1.0
+            if best_ref in self.reference_hashes:
+                candidate_hash = self._average_hash(img)
+                ref_hash = self.reference_hashes[best_ref]
+                hash_distance = self._hamming_distance(candidate_hash, ref_hash)
+                hash_similarity = max(0.0, 1.0 - hash_distance / 64.0)
+            score = float(0.65 * best_score + 0.25 * best_consistency + 0.10 * hash_similarity)
+        else:
+            score = 0.0
+
+        return score, best_ref
 
 
 def load_reference_images(reference_dir: Path) -> list[Path]:
@@ -853,6 +1002,54 @@ def evaluate_listings_gemini(
     return results
 
 
+def evaluate_listings_orb(
+    listings: list[Listing],
+    reference_images: list[Path],
+    min_score: float,
+) -> list[MatchResult]:
+    matcher = OrbMatcher()
+    matcher.prepare_references(reference_images)
+    results: list[MatchResult] = []
+
+    for idx, listing in enumerate(listings, start=1):
+        try:
+            image_bytes = download_image_bytes(listing.image_url)
+            score, best_ref = matcher.match(image_bytes)
+            is_match = score >= min_score
+            reason = f"Best ORB feature match with '{best_ref}' is {score:.3f}"
+            if not is_match:
+                reason = f"Score {score:.2f} is below threshold {min_score:.2f}. {reason}"
+            print(
+                f"[{idx}/{len(listings)}] {listing.title[:70]} -> "
+                f"match={is_match} score={score:.2f} ref={best_ref}"
+            )
+            results.append(
+                MatchResult(
+                    listing=listing,
+                    is_match=is_match,
+                    score=score,
+                    reason=reason,
+                    raw_model_response=json.dumps({
+                        "matcher": "orb",
+                        "best_reference": best_ref,
+                        "score": round(score, 6)
+                    }),
+                )
+            )
+        except Exception as exc:
+            print(f"[{idx}/{len(listings)}] Failed on listing '{listing.title}': {exc}")
+            results.append(
+                MatchResult(
+                    listing=listing,
+                    is_match=False,
+                    score=0.0,
+                    reason=f"Evaluation failed: {exc}",
+                    raw_model_response="",
+                )
+            )
+    return results
+
+
 def evaluate_listings_clip(
     listings: list[Listing],
     reference_images: list[Path],
@@ -881,7 +1078,11 @@ def evaluate_listings_clip(
                     is_match=is_match,
                     score=score,
                     reason=reason,
-                    raw_model_response=f'{{"matcher":"clip","best_reference":"{best_ref}","score":{score:.6f}}}',
+                    raw_model_response=json.dumps({
+                        "matcher": "clip",
+                        "best_reference": best_ref,
+                        "score": round(score, 6)
+                    }),
                 )
             )
         except Exception as exc:
@@ -898,24 +1099,48 @@ def evaluate_listings_clip(
     return results
 
 
-def test_clip_match(reference_path: Path, candidate_path: Path, clip_model_name: str) -> None:
-    matcher = ClipMatcher(clip_model_name)
-    matcher.prepare_references([reference_path])
-    candidate_bytes = candidate_path.read_bytes()
-    score, best_ref = matcher.match(candidate_bytes)
-    print("\n=== CLIP comparison test ===")
+def test_match(reference_path: Path, candidate_path: Path, matcher_mode: str, clip_model_name: str) -> None:
+    if matcher_mode == "orb":
+        matcher = OrbMatcher()
+        matcher.prepare_references([reference_path])
+        candidate_bytes = candidate_path.read_bytes()
+        score, best_ref = matcher.match(candidate_bytes)
+        matcher_name = "ORB"
+    else:  # clip
+        matcher = ClipMatcher(clip_model_name)
+        matcher.prepare_references([reference_path])
+        candidate_bytes = candidate_path.read_bytes()
+        score, best_ref = matcher.match(candidate_bytes)
+        matcher_name = "CLIP"
+
+    print(f"\n=== {matcher_name} comparison test ===")
     print(f"reference: {reference_path}")
     print(f"candidate: {candidate_path}")
     print(f"best reference match: {best_ref}")
     print(f"similarity score: {score:.6f}")
-    print("=== End of test ===\n")
+    print(f"=== End of {matcher_name} test ===\n")
 
 
 def persist_results(results: list[MatchResult], output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_path = output_dir / f"matches_{ts}.json"
-    output_payload = [asdict(r) for r in results]
+
+    # Convert to dict and ensure all values are JSON serializable
+    output_payload = []
+    for r in results:
+        try:
+            result_dict = asdict(r)
+            # Ensure all fields are properly serializable
+            result_dict['is_match'] = bool(result_dict['is_match'])
+            result_dict['score'] = float(result_dict['score'])
+            result_dict['reason'] = str(result_dict['reason'])
+            result_dict['raw_model_response'] = str(result_dict['raw_model_response'])
+            output_payload.append(result_dict)
+        except Exception as exc:
+            print(f"Warning: Failed to serialize result for '{r.listing.title}': {exc}")
+            continue
+
     output_path.write_text(json.dumps(output_payload, indent=2), encoding="utf-8")
     return output_path
 
@@ -942,6 +1167,7 @@ def run_scan(
     keyword: str,
     references_dir: str,
     max_listings: int,
+    per_reference_max: int,
     max_reference_images: int,
     gemini_batch_size: int,
     clip_model_name: str,
@@ -958,7 +1184,7 @@ def run_scan(
     if search_mode == "image":
         print("Running Vinted image-search mode using reference images...")
         listings = scrape_by_reference_images(
-            reference_images=refs, per_reference_max=max_listings, headed=headed
+            reference_images=refs, per_reference_max=per_reference_max, headed=headed
         )
     else:
         print(f"Search URL: {search_url}")
@@ -984,6 +1210,13 @@ def run_scan(
             reference_images=refs,
             min_score=min_score,
             clip_model_name=clip_model_name,
+        )
+    elif matcher_mode == "orb":
+        print("Evaluating with ORB feature matching")
+        results = evaluate_listings_orb(
+            listings=listings,
+            reference_images=refs,
+            min_score=min_score,
         )
     else:
         model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -1033,12 +1266,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--matcher-mode",
-        choices=["clip", "gemini"],
+        choices=["clip", "orb", "gemini"],
         default="clip",
-        help="Image matching engine. clip runs locally; gemini uses API.",
+        help="Image matching engine. clip=CLIP semantic, orb=ORB features, gemini=API.",
     )
     parser.add_argument("--references-dir", default="references", help="Folder with reference images")
     parser.add_argument("--max-listings", type=int, default=24, help="Max listings from first page")
+    parser.add_argument(
+        "--per-reference-max",
+        type=int,
+        default=12,
+        help="Max listings to collect per reference image in image-search mode.",
+    )
     parser.add_argument(
         "--max-reference-images",
         type=int,
@@ -1064,9 +1303,15 @@ def main() -> None:
     parser.add_argument("--min-score", type=float, default=0.70, help="Minimum Gemini score to count as match")
     parser.add_argument("--output-dir", default="output", help="JSON output folder")
     parser.add_argument(
-        "--test-clip",
+        "--test-match",
         action="store_true",
-        help="Run a local CLIP comparison test between a reference image and a candidate image.",
+        help="Run a local image comparison test between a reference image and a candidate image.",
+    )
+    parser.add_argument(
+        "--test-matcher",
+        choices=["clip", "orb"],
+        default="clip",
+        help="Matcher to use for --test-match (default: clip).",
     )
     parser.add_argument(
         "--test-reference-path",
@@ -1092,12 +1337,13 @@ def main() -> None:
     args = parser.parse_args()
     title_blacklist_words = parse_blacklist_words(args.blacklist_words)
 
-    if args.test_clip:
+    if args.test_match:
         if not args.test_reference_path or not args.test_candidate_path:
-            raise RuntimeError("--test-clip requires --test-reference-path and --test-candidate-path.")
-        test_clip_match(
+            raise RuntimeError("--test-match requires --test-reference-path and --test-candidate-path.")
+        test_match(
             Path(args.test_reference_path),
             Path(args.test_candidate_path),
+            args.test_matcher,
             args.clip_model_name,
         )
         return
@@ -1115,6 +1361,7 @@ def main() -> None:
             keyword=args.keyword,
             references_dir=args.references_dir,
             max_listings=args.max_listings,
+            per_reference_max=args.per_reference_max,
             max_reference_images=args.max_reference_images,
             gemini_batch_size=args.gemini_batch_size,
             clip_model_name=args.clip_model_name,
@@ -1142,6 +1389,7 @@ def main() -> None:
                 keyword=args.keyword,
                 references_dir=args.references_dir,
                 max_listings=args.max_listings,
+                per_reference_max=args.per_reference_max,
                 max_reference_images=args.max_reference_images,
                 gemini_batch_size=args.gemini_batch_size,
                 clip_model_name=args.clip_model_name,

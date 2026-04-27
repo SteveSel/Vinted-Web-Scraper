@@ -5,3 +5,4 @@ google-genai
 Pillow
 torch
 transformers
+opencv-python
