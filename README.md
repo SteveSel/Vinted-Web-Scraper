@@ -1,6 +1,6 @@
 # Vinted Visual Search Assistant
 
-This project scrapes the **first page of Vinted listings** and compares each listing image to local reference images in the `references` folder using either local CLIP embeddings (default) or Gemini API.
+This project scrapes the **first page of Vinted listings** and compares each listing image to local reference images in the `references` folder using either local CLIP embeddings (default), Gemini API, or Groq cloud image comparison.
 
 ## What it does
 
@@ -26,14 +26,16 @@ Create env file:
 cp .env.example .env
 ```
 
-Then set your Gemini key:
+Then set your API keys:
 
 ```bash
 GEMINI_API_KEY=...
 GEMINI_MODEL=gemini-2.5-flash
+GROQ_API_KEY=...
+GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
 ```
 
-If you use default CLIP matcher, Gemini key is not required.
+If you use default CLIP matcher, neither Gemini nor Groq keys are required.
 
 ## Usage
 
@@ -65,6 +67,12 @@ Use local CLIP matcher explicitly (no API):
 
 ```bash
 python main.py --search-mode image --matcher-mode clip --loop-minutes 0 --max-reference-images 5
+```
+
+Use Groq cloud image comparison:
+
+```bash
+python main.py --search-mode image --matcher-mode groq --loop-minutes 0 --max-reference-images 5
 ```
 
 Title blacklist before visual matching (defaults include `video,videocassette,movie,pelicula,film`):

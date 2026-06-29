@@ -6,3 +6,6 @@ output/
 .venv
 references/
 algoCheck/
+bin/
+lib64/
+include/

@@ -2,7 +2,7 @@ playwright
 requests
 python-dotenv
 google-genai
+groq
 Pillow
 torch
 transformers
-opencv-python
