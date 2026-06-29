@@ -89,6 +89,19 @@ def guess_image_mime_type(path: Path) -> str:
     return "application/octet-stream"
 
 
+def detect_mime_from_bytes(data: bytes) -> str:
+    """Detect image MIME type from magic bytes. Falls back to image/jpeg."""
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"GIF8":
+        return "image/gif"
+    return "image/jpeg"
+
+
 def normalize_text_for_match(value: str) -> str:
     lowered = value.lower().strip()
     no_accents = "".join(

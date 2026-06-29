@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -13,6 +14,7 @@ from transformers import CLIPModel, CLIPProcessor
 
 from models import Listing, MatchResult
 from utils import (
+    detect_mime_from_bytes,
     download_image_bytes,
     get_gemini_api_key,
     get_groq_api_key,
@@ -62,10 +64,16 @@ class GroqMatcher:
         ref_url = image_bytes_to_data_url(ref_bytes, ref_mime)
         cand_url = image_bytes_to_data_url(cand_bytes, cand_mime)
         prompt = (
-            'Compare these two images and give a numerical value between 0 and 1 as a grade if the "comparason image" '
-            'contains the cassette from the "reference image". Only respond with the number, do not give the reason for the decision'
+            "Image 1 is the REFERENCE cassette tape. Image 2 is a CANDIDATE listing.\n"
+            "Rate visual similarity from 0.0 to 1.0:\n"
+            "  1.0 = identical product (same brand, model, colorway)\n"
+            "  0.7 = same brand, different model or edition\n"
+            "  0.5 = same type of product, different brand\n"
+            "  0.2 = vaguely similar category\n"
+            "  0.0 = completely different product\n"
+            "Respond with ONLY the number, nothing else."
         )
-        completion = self.client.chat.completions.create(
+        response = self.client.chat.completions.create(
             model=self.model_name,
             messages=[{
                 "role": "user",
@@ -75,19 +83,18 @@ class GroqMatcher:
                     {"type": "image_url", "image_url": {"url": cand_url}},
                 ],
             }],
-            temperature=1,
-            max_completion_tokens=1024,
-            top_p=1,
-            stream=True,
-            stop=None,
+            temperature=0,
+            max_completion_tokens=16,
         )
-        raw_text = ""
-        for chunk in completion:
-            raw_text += chunk.choices[0].delta.content or ""
+        raw_text = response.choices[0].message.content or ""
 
-        match = re.search(r"([01](?:\.\d+)?)", raw_text.strip())
+        raw_text = raw_text.strip()
+        match = re.search(r"([01](?:\.\d+)?)", raw_text)
         if match:
-            return float(match.group(1))
+            score = float(match.group(1))
+            if score == 0.0:
+                print(f"  [Groq] Score=0 — raw response: {raw_text[:200]}")
+            return score
         raise RuntimeError(f"Could not parse numeric score from Groq response: {raw_text}")
 
     def score(self, image_bytes: bytes) -> tuple[float, str]:
@@ -96,9 +103,13 @@ class GroqMatcher:
         if not self._ref_bytes:
             raise RuntimeError("GroqMatcher references not prepared.")
 
-        cand_mime = "image/jpeg"  # ponytail: good enough default, upgrade if needed
+        cand_mime = detect_mime_from_bytes(image_bytes)
         best_score, best_ref = 0.0, ""
+        first = True
         for ref_name, (ref_bytes, ref_mime) in self._ref_bytes.items():
+            if not first:
+                time.sleep(1.5)  # ponytail: avoid 429 storms, increase if still rate-limited
+            first = False
             s = self._compare_pair(ref_bytes, ref_mime, image_bytes, cand_mime)
             if s > best_score:
                 best_score, best_ref = s, ref_name
@@ -120,7 +131,17 @@ class ClipMatcher:
         inputs = self.processor(images=images, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad():
-            feats = self.model.get_image_features(**inputs)
+            raw = self.model.get_image_features(**inputs)
+            if isinstance(raw, torch.Tensor):
+                feats = raw
+            elif hasattr(raw, "image_embeds") and isinstance(raw.image_embeds, torch.Tensor):
+                feats = raw.image_embeds
+            elif hasattr(raw, "pooler_output") and isinstance(raw.pooler_output, torch.Tensor):
+                feats = raw.pooler_output
+            elif hasattr(raw, "last_hidden_state") and isinstance(raw.last_hidden_state, torch.Tensor):
+                feats = raw.last_hidden_state[:, 0, :]
+            else:
+                raise RuntimeError(f"Unsupported CLIP output type: {type(raw)}")
             feats = torch.nn.functional.normalize(feats, p=2, dim=-1)
         return feats
 
@@ -257,6 +278,8 @@ def evaluate_listings(
 
         for listing in group_listings:
             idx += 1
+            if matcher_mode == "groq" and idx > 1:
+                time.sleep(1.5)  # ponytail: rate-limit courtesy, increase if still 429
             try:
                 img_bytes = download_image_bytes(listing.image_url)
                 score, best_ref = m.score(img_bytes)
